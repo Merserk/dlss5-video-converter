@@ -147,7 +147,9 @@ def probe_video(path: str | os.PathLike[str]) -> dict:
     }
 
 
-def _encoder_probe(codec: str, width: int, height: int) -> bool:
+def _encoder_probe(
+    codec: str, width: int, height: int, env: dict[str, str] | None = None
+) -> bool:
     command = [
         str(FFMPEG),
         "-v",
@@ -169,6 +171,7 @@ def _encoder_probe(codec: str, width: int, height: int) -> bool:
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=env,
         ).returncode
         == 0
     )
@@ -180,6 +183,7 @@ def _codec_command(
     width: int,
     height: int,
     fps: float,
+    env: dict[str, str] | None = None,
 ) -> tuple[list[str], str, dict]:
     quality = resolve_encoding_quality(quality_name, codec, width, height, fps)
     if codec == "ProRes Proxy":
@@ -196,7 +200,7 @@ def _codec_command(
         nvenc_quality = ["-rc", "vbr", "-b:v", bitrate]
         software_quality = ["-b:v", bitrate]
     if codec == "H.264":
-        if _encoder_probe("h264_nvenc", width, height):
+        if _encoder_probe("h264_nvenc", width, height, env):
             return (
                 [
                     "-c:v",
@@ -218,7 +222,7 @@ def _codec_command(
             quality,
         )
     if codec == "HEVC":
-        if _encoder_probe("hevc_nvenc", width, height):
+        if _encoder_probe("hevc_nvenc", width, height, env):
             return (
                 [
                     "-c:v",
@@ -241,7 +245,7 @@ def _codec_command(
         )
     if codec != "AV1":
         raise ValueError(f"Unknown video codec: {codec!r}.")
-    if not _encoder_probe("av1_nvenc", width, height):
+    if not _encoder_probe("av1_nvenc", width, height, env):
         raise RuntimeError(
             f"AV1 NVENC cannot encode the requested {width}×{height} output on this GPU/driver. "
             "Choose H.264/HEVC or a lower upscaling factor."
@@ -261,10 +265,19 @@ def start_encoder(
     width: int,
     height: int,
     fps: float,
+    encode_gpu: dict | None = None,
 ):
+    env = None
+    if encode_gpu and encode_gpu.get("uuid"):
+        # Pin NVENC (a CUDA context underneath) to the chosen card; probing uses
+        # the same environment so the fallback decision matches the real encode.
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(encode_gpu["uuid"])
     codec_args, selected, quality = _codec_command(
-        codec, quality_name, width, height, fps
+        codec, quality_name, width, height, fps, env
     )
+    if env is not None and selected.endswith("_nvenc"):
+        selected = f"{selected} on {encode_gpu['name']}"
     command = [
         str(FFMPEG),
         "-hide_banner",
@@ -288,6 +301,7 @@ def start_encoder(
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        env=env,
     )
     controller.register(process)
     logs: list[str] = []

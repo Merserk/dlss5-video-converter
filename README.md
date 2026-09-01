@@ -14,6 +14,16 @@ https://github.com/user-attachments/assets/f27f61a3-cad3-4278-af66-eb11c54600fb
 
 https://github.com/user-attachments/assets/d91591a9-2df1-4b4b-b18f-bd4dff73d5bc
 
+## Changes in this fork
+
+This fork ([speedyrulz/dlss5-visual-enhancer](https://github.com/speedyrulz/dlss5-visual-enhancer)) adds multi-GPU support, a pipelined render loop, and several fixes on top of the upstream project:
+
+- **GPU selection:** a GPU dropdown on both tabs lists every detected RTX card (with a Refresh button and an Auto default), persisted in `config.ini` as `gpu`. The native worker always binds the first NVIDIA Direct3D adapter, so a selection it cannot honor fails fast before any frames render, with instructions instead of a wrong-GPU render. Reports and status lines name the adapter the worker actually bound rather than the first card `nvidia-smi` lists.
+- **Dual-GPU encode:** on systems with two RTX cards, NVENC encoding runs on the card the DLSS render is not using ("Use both GPUs" checkbox, `dual_gpu_encode` in `config.ini`). The offload is skipped automatically when the second card has under 2 GB of free VRAM, since an NVENC session that cannot allocate takes the whole render down mid-encode.
+- **Pipelined rendering (~2x faster):** decoding plus optical-flow guide generation, worker submission, and the encoder handoff now run in separate pipeline stages, so the CPU work and pipe transfers happen while the GPU evaluates the current frame. Measured on a 1836x3264 DLAA render: 2.86 to 5.9 fps, which is within 2% of the native worker's maximum throughput. Output is unchanged; the DLSS stream itself remains strictly sequential and in order.
+- **Variable-frame-rate fix:** VFR videos (typical phone footage) previously crashed at a content-dependent frame with `Invalid argument ... returned 22`. The intermediate stream quantized timestamps to average-frame-duration ticks, so two close frames could collide into one tick and the muxer rejected the duplicate. The encoder context now keeps the source's fine time base, preserving exact VFR timing; a safety guard bumps genuinely duplicated timestamps and reports the count as `pts_collisions_adjusted`.
+- **Better failure diagnostics:** if the video encoder process dies, the error names the encoder, exit code, and frame, and includes FFmpeg's stderr; failure reports gain an `encoder_log` section.
+
 ## Installation
 
 1. Download the [latest release](https://github.com/Merserk/dlss5-visual-enhancer/releases/latest).

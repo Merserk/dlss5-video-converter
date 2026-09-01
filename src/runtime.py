@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import struct
 import subprocess
@@ -183,6 +184,7 @@ def write_failure_report(
     worker_code: int | None = None,
     worker_logs: list[str] | None = None,
     reshade_lines: list[str] | None = None,
+    encoder_logs: list[str] | None = None,
     logs_dir: Path | None = None,
 ) -> Path:
     """Persist diagnostics even when the incomplete media output is removed."""
@@ -201,6 +203,7 @@ def write_failure_report(
         "worker_exit_code": worker_code,
         "worker_log": list(worker_logs or []),
         "reshade_feature_18_log": list(reshade_lines or []),
+        "encoder_log": list(encoder_logs or []),
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report_path.resolve()
@@ -304,10 +307,33 @@ def rotate_frame(frame: np.ndarray, rotation: int) -> np.ndarray:
     return frame
 
 
-def detect_gpu() -> dict:
+AUTO_GPU = "Auto"
+
+_GPU_PREFERENCE_LOCK = threading.Lock()
+_preferred_gpu = AUTO_GPU
+
+
+def gpu_key(entry: dict[str, Any]) -> str:
+    """The stable label used by the settings file and the UI dropdown."""
+    return f"{entry['index']}: {entry['name']}"
+
+
+def set_preferred_gpu(value: str | None) -> None:
+    """Choose which detected GPU later renders use; AUTO_GPU keeps the first one."""
+    global _preferred_gpu
+    with _GPU_PREFERENCE_LOCK:
+        _preferred_gpu = value or AUTO_GPU
+
+
+def get_preferred_gpu() -> str:
+    with _GPU_PREFERENCE_LOCK:
+        return _preferred_gpu
+
+
+def _query_gpus() -> list[list[str]]:
     command = [
         "nvidia-smi",
-        "--query-gpu=name,driver_version,memory.total,compute_cap",
+        "--query-gpu=index,name,driver_version,memory.total,memory.free,compute_cap,uuid",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -316,31 +342,86 @@ def detect_gpu() -> dict:
         raise RuntimeError(
             "NVIDIA driver tools are unavailable; an RTX GPU and current driver are required."
         ) from exc
-    candidates = []
+    rows = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 4 and "RTX" in parts[0].upper():
-            candidates.append(parts)
-    if not candidates:
+        if len(parts) >= 7 and "RTX" in parts[1].upper():
+            rows.append(parts)
+    return rows
+
+
+def list_gpus() -> list[dict]:
+    """Every supported RTX GPU in nvidia-smi order."""
+    entries = []
+    for index, name, driver, memory, memory_free, capability, uuid in _query_gpus():
+        match = re.search(r"RTX\s+(\d{2})", name.upper())
+        generation = int(match.group(1)) if match else 0
+        if generation < 30:
+            continue
+        entries.append(
+            {
+                "index": int(index),
+                "name": name,
+                "display_name": (
+                    f"{name} (experimental RTX 30 path; may be very slow)"
+                    if generation == 30
+                    else name
+                ),
+                "driver": driver,
+                "memory_mb": int(memory),
+                "memory_free_mb": int(memory_free),
+                "compute_capability": capability,
+                "uuid": uuid,
+                "generation": generation,
+                "beta": generation == 30,
+            }
+        )
+    return entries
+
+
+def gpu_choices() -> list[str]:
+    """Dropdown choices: automatic selection plus every detected RTX GPU."""
+    try:
+        entries = list_gpus()
+    except RuntimeError:
+        return [AUTO_GPU]
+    return [AUTO_GPU, *(gpu_key(entry) for entry in entries)]
+
+
+def detect_gpu(preferred: str | None = None) -> dict:
+    entries = list_gpus()
+    if not entries:
+        if _query_gpus():
+            raise RuntimeError(
+                "The detected NVIDIA GPUs are outside the supported RTX 30/40/50 scope."
+            )
         raise RuntimeError("No supported NVIDIA RTX GPU was detected.")
-    name, driver, memory, capability = candidates[0]
-    match = re.search(r"RTX\s+(\d{2})", name.upper())
-    generation = int(match.group(1)) if match else 0
-    if generation < 30:
-        raise RuntimeError(f"{name} is outside the supported RTX 30/40/50 scope.")
-    return {
-        "name": name,
-        "display_name": (
-            f"{name} (experimental RTX 30 path; may be very slow)"
-            if generation == 30
-            else name
-        ),
-        "driver": driver,
-        "memory_mb": int(memory),
-        "compute_capability": capability,
-        "generation": generation,
-        "beta": generation == 30,
-    }
+    if preferred is None:
+        preferred = get_preferred_gpu()
+    selected = entries[0]
+    if preferred and preferred != AUTO_GPU:
+        wanted = str(preferred).strip()
+        head = wanted.split(":", 1)[0].strip()
+        match = next(
+            (
+                entry
+                for entry in entries
+                if gpu_key(entry) == wanted
+                or entry["uuid"] == wanted
+                or entry["name"] == wanted
+                or (head.isdigit() and entry["index"] == int(head))
+            ),
+            None,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"The selected GPU {preferred!r} is no longer available. "
+                "Pick another GPU in the settings."
+            )
+        selected = match
+    selected = dict(selected)
+    selected["requested"] = bool(preferred) and preferred != AUTO_GPU
+    return selected
 
 
 def validate_runtime_files() -> None:
@@ -400,9 +481,14 @@ class DLSSFrameSession:
             reshade_log_path.read_bytes() if reshade_log_path.exists() else b""
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        worker_env = os.environ.copy()
+        if gpu.get("uuid"):
+            # Point every CUDA-aware component in the worker at the chosen GPU.
+            worker_env["CUDA_VISIBLE_DEVICES"] = str(gpu["uuid"])
         self.worker = subprocess.Popen(
             [str(WORKER), "--video"],
             cwd=RUNTIME,
+            env=worker_env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -497,9 +583,49 @@ class DLSSFrameSession:
                 )
             self.output_width = output_width
             self.output_height = output_height
+            self._reconcile_gpu_selection()
         except Exception:
             self.abort()
             raise
+
+    def bound_adapter_name(self, timeout: float = 5.0) -> str | None:
+        """The adapter the native worker actually bound, from its own startup log."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for line in self.worker_logs:
+                match = re.search(r"\[host\] adapter \d+: (.+?) vendor=", line)
+                if match:
+                    return match.group(1).strip()
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+
+    def _reconcile_gpu_selection(self) -> None:
+        """The worker binds the first NVIDIA D3D adapter; honor or report that."""
+        bound = self.bound_adapter_name()
+        if not bound:
+            return
+        self.gpu["bound_adapter"] = bound
+        if bound.casefold() == str(self.gpu["name"]).casefold():
+            return
+        if self.gpu.get("requested"):
+            raise RuntimeError(
+                f"The native DLSS worker bound {bound}, not the selected "
+                f"{self.gpu['name']}. It always uses the first NVIDIA Direct3D adapter, "
+                "which Windows chooses. Select that GPU instead, or make the wanted card "
+                "the first adapter (disable the other one in Device Manager) and retry."
+            )
+        # Automatic selection: report the adapter that actually rendered.
+        replacement = next(
+            (entry for entry in list_gpus() if entry["name"].casefold() == bound.casefold()),
+            None,
+        )
+        if replacement is None:
+            self.gpu["name"] = bound
+            self.gpu["display_name"] = bound
+            return
+        self.gpu.update(replacement)
+        validate_gpu_runtime(self.gpu, self.runtime_bundle)
 
     def reshade_log_text(self) -> str:
         """Return only ReShade output created during this worker session."""
@@ -528,7 +654,22 @@ class DLSSFrameSession:
         ]
         return (relevant or selected)[-limit:]
 
-    def process(
+    def _worker_failure(self, frame_index: int, cause: BaseException) -> RuntimeError:
+        worker_code = self.worker.wait(timeout=10)
+        self.worker_thread.join(timeout=2)
+        details = classify_worker_failure(
+            worker_code=worker_code,
+            frame_index=frame_index,
+            worker_logs=self.worker_logs,
+            reshade_lines=self.reshade_diagnostics(),
+            gpu=self.gpu,
+            runtime_bundle=self.runtime_bundle,
+        )
+        error = RuntimeError(details)
+        error.__cause__ = cause
+        return error
+
+    def send_frame(
         self,
         *,
         index: int,
@@ -536,29 +677,29 @@ class DLSSFrameSession:
         motion: np.ndarray,
         reset: bool,
         pts: int,
-    ) -> tuple[np.ndarray, int]:
+    ) -> None:
+        """Queue one frame into the worker without waiting for its result."""
         if self.controller.cancel.is_set():
             raise Cancelled("Render stopped by user.")
-        assert self.worker.stdin is not None and self.worker.stdout is not None
+        assert self.worker.stdin is not None
         frame_header = struct.pack("<4Iq", FRAME_MAGIC, index, int(reset), 0, pts)
-        self.worker.stdin.write(frame_header)
-        self.worker.stdin.write(np.ascontiguousarray(rgba, dtype=np.uint8).tobytes())
-        self.worker.stdin.write(np.ascontiguousarray(motion, dtype=np.float16).tobytes())
-        self.worker.stdin.flush()
+        try:
+            self.worker.stdin.write(frame_header)
+            self.worker.stdin.write(np.ascontiguousarray(rgba, dtype=np.uint8).tobytes())
+            self.worker.stdin.write(
+                np.ascontiguousarray(motion, dtype=np.float16).tobytes()
+            )
+            self.worker.stdin.flush()
+        except OSError as exc:
+            raise self._worker_failure(index, exc)
+
+    def receive_frame(self, index: int) -> tuple[np.ndarray, int]:
+        """Read the result for the oldest queued frame; results arrive in order."""
+        assert self.worker.stdout is not None
         try:
             result_header = _read_exact(self.worker.stdout, struct.calcsize("<5Iq"))
         except EOFError as exc:
-            worker_code = self.worker.wait(timeout=10)
-            self.worker_thread.join(timeout=2)
-            details = classify_worker_failure(
-                worker_code=worker_code,
-                frame_index=index,
-                worker_logs=self.worker_logs,
-                reshade_lines=self.reshade_diagnostics(),
-                gpu=self.gpu,
-                runtime_bundle=self.runtime_bundle,
-            )
-            raise RuntimeError(details) from exc
+            raise self._worker_failure(index, exc)
         magic, out_index, ok, byte_count, ngx_result, out_pts = struct.unpack(
             "<5Iq", result_header
         )
@@ -573,6 +714,18 @@ class DLSSFrameSession:
             _read_exact(self.worker.stdout, byte_count), dtype=np.uint8
         ).reshape(self.output_height, self.output_width, 4)
         return output.copy(), out_pts
+
+    def process(
+        self,
+        *,
+        index: int,
+        rgba: np.ndarray,
+        motion: np.ndarray,
+        reset: bool,
+        pts: int,
+    ) -> tuple[np.ndarray, int]:
+        self.send_frame(index=index, rgba=rgba, motion=motion, reset=reset, pts=pts)
+        return self.receive_frame(index)
 
     def close(self) -> None:
         if self.closed:

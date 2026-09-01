@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ffmpeg import ENCODING_QUALITIES
+from .runtime import AUTO_GPU
 from .video import (
     NR_PRESETS,
     NR_STYLES,
@@ -38,6 +39,8 @@ class UISettings:
     image_quality: int = 95
     nr_preset: str = "Default"
     automatic_mask: bool = False
+    gpu: str = AUTO_GPU
+    dual_gpu_encode: bool = True
 
     def component_values(
         self,
@@ -85,6 +88,10 @@ def _validate(settings: UISettings) -> UISettings:
     for label, (value, choices) in allowed.items():
         if value not in choices:
             raise ValueError(f"Unknown {label}: {value!r}.")
+    if not isinstance(settings.gpu, str) or not settings.gpu.strip():
+        raise ValueError("GPU must be a non-empty selection label.")
+    if not isinstance(settings.dual_gpu_encode, bool):
+        raise ValueError("Dual-GPU encode must be a boolean value.")
     if isinstance(settings.image_quality, bool) or not 1 <= int(settings.image_quality) <= 100:
         raise ValueError("Image quality must be an integer from 1 to 100.")
     if int(settings.image_quality) != settings.image_quality:
@@ -153,6 +160,8 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
         ),
         image_quality=image_quality(),
+        gpu=section.get("gpu", DEFAULT_SETTINGS.gpu) or DEFAULT_SETTINGS.gpu,
+        dual_gpu_encode=boolean("dual_gpu_encode", DEFAULT_SETTINGS.dual_gpu_encode),
     )
 
 
@@ -175,6 +184,8 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "quality": settings.quality,
         "image_format": settings.image_format,
         "image_quality": str(settings.image_quality),
+        "gpu": settings.gpu,
+        "dual_gpu_encode": str(settings.dual_gpu_encode).lower(),
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")
