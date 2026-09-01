@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
+import threading
 import time
 import zipfile
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -15,26 +18,23 @@ import numpy as np
 import pillow_heif
 import rawpy
 import resvg_py
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageCms, ImageOps, TiffImagePlugin
 
+from .naming import output_filename, require_available_output, validate_rename
 from .runtime import (
     LOGS,
     OUTPUTS,
-    RUNTIME,
-    WORKER,
     Cancelled,
     DLSSFrameSession,
     active_job,
-    detect_gpu,
-    inspect_runtime_bundle,
     resize_fit,
     validate_gpu_runtime,
-    validate_runtime_files,
     verify_feature_18,
     write_failure_report,
 )
 from .video import (
     ConversionOptions,
+    DLSS_MODEL_PRESETS,
     resolve_native_settings,
     resolve_output_size,
     resolve_upscaling_mode,
@@ -46,6 +46,9 @@ Image.MAX_IMAGE_PIXELS = 100_000_000
 
 IMAGE_FORMATS = ("PNG", "JPEG", "WebP", "AVIF", "TIFF")
 IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp", "AVIF": ".avif", "TIFF": ".tiff"}
+_PREVIEW_CACHE_LIMIT = 32
+_preview_cache: OrderedDict[str, Image.Image] = OrderedDict()
+_preview_cache_lock = threading.Lock()
 RAW_EXTENSIONS = {
     ".3fr", ".arw", ".bay", ".cap", ".cr2", ".cr3", ".dcr", ".dcs", ".dng",
     ".drf", ".eip", ".erf", ".fff", ".gpr", ".iiq", ".k25", ".kdc", ".mdc",
@@ -66,9 +69,12 @@ class ImageConversionOptions:
     output_format: str = "PNG"
     quality: int = 95
     preserve_metadata: bool = True
-    warmup_frames: int = 120
+    warmup_frames: int = 0
     nr_preset: str = "Default"
     automatic_mask: bool = False
+    rename_mode: str = "Auto"
+    custom_suffix: str = "_DLSS5"
+    dlss_model_preset: str = "Default"
 
     def neural_options(self) -> ConversionOptions:
         return ConversionOptions(
@@ -81,6 +87,7 @@ class ImageConversionOptions:
             automatic_mask=self.automatic_mask,
             upscaling_factor=self.upscaling_factor,
             warmup_frames=self.warmup_frames,
+            dlss_model_preset=self.dlss_model_preset,
         )
 
 
@@ -100,6 +107,8 @@ class ImageConversionResult:
     upscaling_factor: float
     dlss_mode: str
     output_format: str
+    dlss_model_preset: str = "Default"
+    applied_dlss_model_preset: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -126,6 +135,7 @@ class _ImageProbe:
     height: int
     output_width: int
     output_height: int
+    decoded: _DecodedImage | None = None
 
 
 @dataclass(slots=True)
@@ -135,6 +145,33 @@ class _DecodedImage:
     decoder: str
     metadata: dict[str, object]
     warnings: list[str]
+
+
+@dataclass(slots=True)
+class _ImageReportData:
+    decoder: str
+    metadata: dict[str, object]
+    warnings: list[str]
+
+
+def _report_data(decoded: _DecodedImage) -> _ImageReportData:
+    """Keep diagnostics without retaining the decoded pixel and alpha arrays."""
+    return _ImageReportData(decoded.decoder, decoded.metadata, decoded.warnings)
+
+
+def _json_safe_metadata(value: object) -> object:
+    """Create a report-only JSON-safe copy without changing save metadata."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, TiffImagePlugin.IFDRational):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_metadata(item) for item in value]
+    if isinstance(value, bytes):
+        return {"type": "bytes", "length": len(value)}
+    return str(value)
 
 
 def _validate_options(options: ImageConversionOptions) -> ConversionOptions:
@@ -148,6 +185,7 @@ def _validate_options(options: ImageConversionOptions) -> ConversionOptions:
         raise ValueError("Image quality must be an integer from 1 to 100.") from exc
     if quality != options.quality or not 1 <= quality <= 100:
         raise ValueError("Image quality must be an integer from 1 to 100.")
+    validate_rename(options.rename_mode, options.custom_suffix)
     neural = options.neural_options()
     resolve_native_settings(neural)
     resolve_upscaling_mode(neural.upscaling_factor)
@@ -195,8 +233,61 @@ def probe_image(path: str | os.PathLike[str]) -> tuple[int, int]:
     return width, height
 
 
+@lru_cache(maxsize=1)
 def _srgb_profile_bytes() -> bytes:
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def initialize_image_runtime() -> None:
+    """Initialize reusable image color-management state during app preparation."""
+    _srgb_profile_bytes()
+
+
+def take_image_preview(output_path: str | os.PathLike[str]) -> Image.Image | None:
+    """Return and remove a UI thumbnail created from the rendered frame in memory."""
+    key = str(Path(output_path).resolve())
+    with _preview_cache_lock:
+        return _preview_cache.pop(key, None)
+
+
+def _remember_image_preview(
+    output_path: Path, rgba: np.ndarray, output_format: str
+) -> None:
+    image = Image.fromarray(rgba, mode="RGBA")
+    try:
+        if output_format == "JPEG":
+            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            background.alpha_composite(image)
+            preview = background
+        else:
+            preview = image.copy()
+        preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+        key = str(output_path.resolve())
+        with _preview_cache_lock:
+            previous = _preview_cache.pop(key, None)
+            if previous is not None:
+                previous.close()
+            _preview_cache[key] = preview
+            while len(_preview_cache) > _PREVIEW_CACHE_LIMIT:
+                _unused_key, unused = _preview_cache.popitem(last=False)
+                unused.close()
+    finally:
+        image.close()
+
+
+def _encode_image(
+    output: Path,
+    rgba: np.ndarray,
+    options: ImageConversionOptions,
+    metadata: dict[str, object],
+) -> list[str]:
+    warnings = save_image(output, rgba, options, metadata)
+    try:
+        _remember_image_preview(output, rgba, options.output_format)
+    except Exception:
+        # A UI convenience must never invalidate an otherwise correct output.
+        pass
+    return warnings
 
 
 def decode_image(path: str | os.PathLike[str]) -> _DecodedImage:
@@ -216,9 +307,15 @@ def decode_image(path: str | os.PathLike[str]) -> _DecodedImage:
         if original_mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "CMYK"}:
             warnings.append(f"Converted {original_mode} source data to 8-bit SDR sRGB.")
 
-        rgba_image = image.convert("RGBA")
-        alpha_image = rgba_image.getchannel("A")
-        rgb_image = rgba_image.convert("RGB")
+        has_alpha = image.mode in {"LA", "RGBA"} or (
+            image.mode == "P" and "transparency" in info
+        )
+        alpha_image = (
+            image.convert("RGBA").getchannel("A")
+            if has_alpha
+            else Image.new("L", image.size, 255)
+        )
+        rgb_image = image.convert("RGB")
         icc_profile = info.get("icc_profile")
         if isinstance(icc_profile, bytes) and icc_profile:
             try:
@@ -234,7 +331,9 @@ def decode_image(path: str | os.PathLike[str]) -> _DecodedImage:
 
         rgb = np.asarray(rgb_image, dtype=np.uint8)
         alpha = np.asarray(alpha_image, dtype=np.uint8)
-        rgba = np.dstack((rgb, alpha))
+        rgba = np.empty((*rgb.shape[:2], 4), dtype=np.uint8)
+        rgba[..., :3] = rgb
+        rgba[..., 3] = alpha
         exif = image.getexif()
         if exif:
             exif[274] = 1
@@ -284,14 +383,19 @@ def save_image(
     warnings: list[str] = []
     args = _metadata_save_args(metadata, output_format) if options.preserve_metadata else {}
     if output_format == "PNG":
-        args.update(optimize=True, compress_level=9)
+        args.update(optimize=False, compress_level=6)
     elif output_format == "TIFF":
         args.update(compression="tiff_deflate")
     elif output_format == "JPEG":
         background = Image.new("RGBA", image.size, (255, 255, 255, 255))
         background.alpha_composite(image)
         image = background.convert("RGB")
-        args.update(quality=int(options.quality), subsampling=0, optimize=True, progressive=True)
+        args.update(
+            quality=int(options.quality),
+            subsampling=0,
+            optimize=False,
+            progressive=False,
+        )
         if np.any(rgba[..., 3] != 255):
             warnings.append("Transparency was composited over white for JPEG output.")
     elif output_format == "WebP":
@@ -310,16 +414,29 @@ def save_image(
     return warnings
 
 
-def _output_path(source: Path, output_format: str, stamp: str, index: int) -> Path:
+def _output_path(
+    source: Path,
+    output_format: str,
+    stamp: str,
+    index: int,
+    rename_mode: str,
+    custom_suffix: str,
+) -> Path:
     suffix = IMAGE_EXTENSIONS[output_format]
     safe_stem = source.stem.strip().rstrip(".") or "image"
-    return OUTPUTS / f"{safe_stem}_DLSS5_IMAGE_{stamp}-{index + 1:04d}{suffix}"
+    return OUTPUTS / output_filename(
+        source,
+        suffix,
+        rename_mode,
+        custom_suffix,
+        f"{safe_stem}_DLSS5_IMAGE_{stamp}-{index + 1:04d}",
+    )
 
 
 def _write_report(
     result: ImageConversionResult,
     options: ImageConversionOptions,
-    decoded: _DecodedImage,
+    decoded: _ImageReportData,
     gpu: dict,
     session: DLSSFrameSession,
     evidence: dict[str, object],
@@ -332,7 +449,7 @@ def _write_report(
         "gpu": gpu,
         "decoder": decoded.decoder,
         "source_metadata": {
-            key: value
+            key: _json_safe_metadata(value)
             for key, value in decoded.metadata.items()
             if key not in {"icc_profile", "exif", "xmp"}
         },
@@ -346,15 +463,29 @@ def _write_report(
         "output_dimensions": {"width": result.output_width, "height": result.output_height},
         "dlss_mode": result.dlss_mode,
         "requested_upscaling_factor": result.upscaling_factor,
+        "dlss_model_preset": result.dlss_model_preset,
+        "requested_dlss_model_preset": result.dlss_model_preset,
+        "requested_dlss_model_preset_code": DLSS_MODEL_PRESETS[
+            result.dlss_model_preset
+        ],
+        "applied_dlss_model_preset": result.applied_dlss_model_preset,
+        "applied_dlss_model_preset_name": next(
+            name
+            for name, code in DLSS_MODEL_PRESETS.items()
+            if code == result.applied_dlss_model_preset
+        ),
         "pipeline": "renodx-dlssnr-feature18-image",
         "feature_id": 18,
         "feature_18_confirmed": True,
         "ngx_setup_result": f"0x{session.setup_result:08X}",
         "carrier_create_result": evidence["carrier_create_result"],
         "native_settings": session.native_settings,
-        "model_sha256": hashlib.sha256((RUNTIME / "nvngx_dlssnr.dll").read_bytes()).hexdigest(),
-        "worker_sha256": hashlib.sha256(WORKER.read_bytes()).hexdigest(),
+        "addon_release": session.runtime_bundle["addon"]["release"],
+        "addon_sha256": session.runtime_bundle["addon"]["sha256"].lower(),
+        "model_sha256": session.runtime_bundle["neural_runtime"]["sha256"].lower(),
+        "worker_sha256": session.runtime_bundle["worker"]["sha256"].lower(),
         "worker_log": session.worker_logs,
+        "worker_log_dropped_lines": session.worker_log_dropped_lines,
         "dlssnr_evidence": evidence["evidence"],
         "elapsed_seconds": result.elapsed_seconds,
     }
@@ -383,7 +514,7 @@ def _build_manifest_and_zip(
     zip_path = OUTPUTS / f"DLSS5_IMAGE_BATCH_{stamp}.zip"
     temporary = zip_path.with_name(f".{zip_path.stem}.{time.time_ns()}.zip")
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
             for item in successes:
                 archive.write(item.output_path, arcname=Path(item.output_path).name)
         os.replace(temporary, zip_path)
@@ -398,12 +529,14 @@ def convert_images(
     options: ImageConversionOptions | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> ImageBatchResult:
+    from .prepare import prepare_runtime
+
     options = options or ImageConversionOptions()
     neural = _validate_options(options)
     paths = [Path(path).resolve() for path in input_paths]
     if not paths:
         raise ValueError("Choose at least one image.")
-    validate_runtime_files()
+    prepared_runtime = prepare_runtime()
     OUTPUTS.mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
@@ -411,13 +544,57 @@ def convert_images(
     probes: list[_ImageProbe] = []
     for index, path in enumerate(paths):
         try:
-            width, height = probe_image(path)
+            decoded: _DecodedImage | None = None
+            if path.suffix.lower() in {*RAW_EXTENSIONS, ".svg"}:
+                decoded = decode_image(path)
+                height, width = decoded.rgba.shape[:2]
+                if width < 64 or height < 64:
+                    raise ValueError(
+                        f"{path.name} is {width}×{height}; DLSS requires both input "
+                        "dimensions to be at least 64 pixels."
+                    )
+            else:
+                width, height = probe_image(path)
             output_width, output_height = resolve_output_size(
                 width, height, options.upscaling_factor
             )
-            probes.append(_ImageProbe(index, path, width, height, output_width, output_height))
+            probes.append(
+                _ImageProbe(
+                    index, path, width, height, output_width, output_height, decoded
+                )
+            )
         except Exception as exc:
             failures_by_index[index] = ImageConversionFailure(str(path), str(exc))
+
+    planned_outputs: dict[int, Path] = {}
+    reserved_outputs: set[str] = set()
+    available_probes: list[_ImageProbe] = []
+    for probe in probes:
+        output = _output_path(
+            probe.path,
+            options.output_format,
+            stamp,
+            probe.index,
+            options.rename_mode,
+            options.custom_suffix,
+        )
+        output_key = str(output.resolve()).casefold()
+        try:
+            require_available_output(output)
+            if output_key in reserved_outputs:
+                raise FileExistsError(
+                    f"More than one input would create {output.name}. "
+                    "Choose Auto naming or use unique input names."
+                )
+        except Exception as exc:
+            failures_by_index[probe.index] = ImageConversionFailure(
+                str(probe.path), str(exc)
+            )
+            continue
+        reserved_outputs.add(output_key)
+        planned_outputs[probe.index] = output
+        available_probes.append(probe)
+    probes = available_probes
 
     if not probes:
         manifest_path, zip_path = _build_manifest_and_zip(
@@ -433,9 +610,11 @@ def convert_images(
     cancelled = False
     gpu: dict | None = None
     processed_total = 0
+    decode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-decode")
+    encode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlss5-image-encode")
     with active_job() as controller:
-        gpu = detect_gpu()
-        runtime_bundle = inspect_runtime_bundle()
+        gpu = dict(prepared_runtime.gpu)
+        runtime_bundle = prepared_runtime.runtime_bundle
         try:
             validate_gpu_runtime(gpu, runtime_bundle)
         except Exception as exc:
@@ -450,118 +629,203 @@ def convert_images(
         if progress:
             progress(0.0, "Starting feature 18 (the native worker picks the adapter)")
         total = len(probes)
-        for (output_width, output_height), group in groups.items():
-            cursor = 0
-            while cursor < len(group):
-                if controller.cancel.is_set():
-                    cancelled = True
-                    break
-                remaining = group[cursor:]
-                first = remaining[0]
-                try:
-                    factor, mode = resolve_upscaling_mode(neural.upscaling_factor)
-                    session = DLSSFrameSession(
-                        input_width=first.width,
-                        input_height=first.height,
-                        output_width=output_width,
-                        output_height=output_height,
-                        frame_count=len(remaining),
-                        warmup_frames=neural.warmup_frames,
-                        factor=factor,
-                        mode=mode,
-                        native_settings=resolve_native_settings(neural),
-                        gpu=gpu,
-                        runtime_bundle=runtime_bundle,
-                        controller=controller,
-                    )
-                except Exception as exc:
-                    controller.terminate_processes()
-                    report_path = write_failure_report(
-                        operation="image-batch-dlss-setup",
-                        source="; ".join(str(item.path) for item in remaining),
-                        error=exc,
-                        gpu=gpu,
-                        runtime_bundle=runtime_bundle,
-                    )
-                    failure = f"{exc}\nDiagnostic report: {report_path}"
-                    for item in remaining:
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
-                    break
-
-                segment: list[tuple[_ImageProbe, ImageConversionResult, _DecodedImage]] = []
-                sent = 0
-                interrupted = False
-                close_error: Exception | None = None
+        factor, mode = resolve_upscaling_mode(neural.upscaling_factor)
+        native_settings = resolve_native_settings(neural)
+        try:
+            for (output_width, output_height), group in groups.items():
+                cursor = 0
                 while cursor < len(group):
-                    item = group[cursor]
-                    started = time.perf_counter()
                     if controller.cancel.is_set():
                         cancelled = True
-                        interrupted = True
-                        session.abort()
                         break
-                    if progress:
-                        progress(processed_total / max(1, total), f"Preparing {item.path.name}")
+                    remaining = group[cursor:]
+                    first = remaining[0]
                     try:
-                        decoded = decode_image(item.path)
+                        session = DLSSFrameSession(
+                            input_width=first.width,
+                            input_height=first.height,
+                            output_width=output_width,
+                            output_height=output_height,
+                            frame_count=len(remaining),
+                            warmup_frames=neural.warmup_frames,
+                            factor=factor,
+                            mode=mode,
+                            native_settings=native_settings,
+                            gpu=gpu,
+                            runtime_bundle=runtime_bundle,
+                            controller=controller,
+                        )
                     except Exception as exc:
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), str(exc))
+                        controller.terminate_processes()
+                        report_path = write_failure_report(
+                            operation="image-batch-dlss-setup",
+                            source="; ".join(str(item.path) for item in remaining),
+                            error=exc,
+                            gpu=gpu,
+                            runtime_bundle=runtime_bundle,
+                        )
+                        failure = f"{exc}\nDiagnostic report: {report_path}"
+                        for item in remaining:
+                            failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
+                        break
+    
+                    segment: list[
+                        tuple[
+                            _ImageProbe,
+                            ImageConversionResult,
+                            _ImageReportData,
+                            Future[list[str]],
+                            float,
+                        ]
+                    ] = []
+                    sent = 0
+                    motion = np.zeros(
+                        (session.render_height, session.render_width, 2), dtype=np.float16
+                    )
+                    interrupted = False
+                    close_error: Exception | None = None
+                    decode_future: Future[_DecodedImage] | None = decode_executor.submit(
+                        lambda probe=group[cursor]: probe.decoded or decode_image(probe.path)
+                    )
+                    while cursor < len(group):
+                        item = group[cursor]
+                        started = time.perf_counter()
+                        if controller.cancel.is_set():
+                            cancelled = True
+                            interrupted = True
+                            session.abort()
+                            break
+                        if progress:
+                            progress(processed_total / max(1, total), f"Preparing {item.path.name}")
+                        try:
+                            assert decode_future is not None
+                            decoded = decode_future.result()
+                            item.decoded = None
+                            next_cursor = cursor + 1
+                            decode_future = (
+                                decode_executor.submit(
+                                    lambda probe=group[next_cursor]:
+                                    probe.decoded or decode_image(probe.path)
+                                )
+                                if next_cursor < len(group)
+                                else None
+                            )
+                        except Exception as exc:
+                            failures_by_index[item.index] = ImageConversionFailure(str(item.path), str(exc))
+                            cursor += 1
+                            processed_total += 1
+                            session.abort()
+                            interrupted = True
+                            break
+                        try:
+                            render_rgba = resize_fit(
+                                decoded.rgba, session.render_width, session.render_height
+                            )
+                            processed, _pts = session.process(
+                                index=sent,
+                                rgba=render_rgba,
+                                motion=motion,
+                                reset=True,
+                                pts=sent,
+                            )
+                            alpha = (
+                                decoded.alpha
+                                if decoded.alpha.shape == (output_height, output_width)
+                                else cv2.resize(
+                                    decoded.alpha,
+                                    (output_width, output_height),
+                                    interpolation=cv2.INTER_LANCZOS4,
+                                )
+                            )
+                            processed[..., 3] = alpha
+                            output = planned_outputs[item.index]
+                            result = ImageConversionResult(
+                                str(item.path),
+                                str(output),
+                                "",
+                                time.perf_counter() - started,
+                                str(gpu["display_name"]),
+                                item.width,
+                                item.height,
+                                session.render_width,
+                                session.render_height,
+                                output_width,
+                                output_height,
+                                float(options.upscaling_factor),
+                                str(session.mode["name"]),
+                                options.output_format,
+                                options.dlss_model_preset,
+                                session.applied_dlss_model_preset,
+                                list(decoded.warnings),
+                            )
+                            encoding = encode_executor.submit(
+                                _encode_image, output, processed, options, decoded.metadata
+                            )
+                            segment.append(
+                                (item, result, _report_data(decoded), encoding, started)
+                            )
+                            # Keep at most two full rendered frames queued for encoding.
+                            # Completed futures retain only their small warning list.
+                            if len(segment) > 2:
+                                segment[-3][3].result()
+                            sent += 1
+                        except Cancelled:
+                            cancelled = True
+                            session.abort()
+                            interrupted = True
+                            break
+                        except Exception as exc:
+                            session.abort()
+                            report_path = write_failure_report(
+                                operation="image-render",
+                                source=str(item.path),
+                                error=exc,
+                                gpu=gpu,
+                                runtime_bundle=runtime_bundle,
+                                worker_code=session.worker.poll(),
+                                worker_logs=session.worker_logs,
+                                reshade_lines=session.reshade_diagnostics(),
+                            )
+                            failures_by_index[item.index] = ImageConversionFailure(
+                                str(item.path), f"{exc}\nDiagnostic report: {report_path}"
+                            )
+                            interrupted = True
+                            cursor += 1
+                            processed_total += 1
+                            break
                         cursor += 1
                         processed_total += 1
-                        session.abort()
-                        interrupted = True
-                        break
+                        if progress:
+                            progress(processed_total / total, f"Rendered {item.path.name}")
+    
+                    if not segment and interrupted:
+                        if cancelled:
+                            break
+                        continue
+                    if not interrupted:
+                        try:
+                            session.close()
+                        except Exception as exc:
+                            close_error = exc
                     try:
-                        render_rgba = resize_fit(
-                            decoded.rgba, session.render_width, session.render_height
+                        if close_error:
+                            raise close_error
+                        evidence = verify_feature_18(
+                            session.worker_logs, session.reshade_log_text()
                         )
-                        motion = np.zeros(
-                            (session.render_height, session.render_width, 2), dtype=np.float16
-                        )
-                        processed, _pts = session.process(
-                            index=sent,
-                            rgba=render_rgba,
-                            motion=motion,
-                            reset=True,
-                            pts=sent,
-                        )
-                        alpha = cv2.resize(
-                            decoded.alpha,
-                            (output_width, output_height),
-                            interpolation=cv2.INTER_LANCZOS4,
-                        )
-                        processed[..., 3] = alpha
-                        output = _output_path(item.path, options.output_format, stamp, item.index)
-                        encoding_warnings = save_image(output, processed, options, decoded.metadata)
-                        result = ImageConversionResult(
-                            str(item.path),
-                            str(output),
-                            "",
-                            time.perf_counter() - started,
-                            str(gpu["display_name"]),
-                            item.width,
-                            item.height,
-                            session.render_width,
-                            session.render_height,
-                            output_width,
-                            output_height,
-                            float(options.upscaling_factor),
-                            str(session.mode["name"]),
-                            options.output_format,
-                            [*decoded.warnings, *encoding_warnings],
-                        )
-                        segment.append((item, result, decoded))
-                        sent += 1
-                    except Cancelled:
-                        cancelled = True
-                        session.abort()
-                        interrupted = True
-                        break
+                        assert gpu is not None
+                        for item, result, decoded, encoding, item_started in segment:
+                            result.warnings.extend(encoding.result())
+                            result.elapsed_seconds = time.perf_counter() - item_started
+                        for item, result, decoded, _encoding, _item_started in segment:
+                            result.report_path = _write_report(
+                                result, options, decoded, gpu, session, evidence
+                            )
+                            successes_by_index[item.index] = result
                     except Exception as exc:
-                        session.abort()
                         report_path = write_failure_report(
-                            operation="image-render",
-                            source=str(item.path),
+                            operation="image-batch-verification",
+                            source="; ".join(str(item.path) for item, *_rest in segment),
                             error=exc,
                             gpu=gpu,
                             runtime_bundle=runtime_bundle,
@@ -569,60 +833,21 @@ def convert_images(
                             worker_logs=session.worker_logs,
                             reshade_lines=session.reshade_diagnostics(),
                         )
-                        failures_by_index[item.index] = ImageConversionFailure(
-                            str(item.path), f"{exc}\nDiagnostic report: {report_path}"
-                        )
-                        interrupted = True
-                        cursor += 1
-                        processed_total += 1
-                        break
-                    cursor += 1
-                    processed_total += 1
-                    if progress:
-                        progress(processed_total / total, f"Rendered {item.path.name}")
-
-                if not segment and interrupted:
+                        failure = f"{exc}\nDiagnostic report: {report_path}"
+                        for item, result, _decoded, encoding, _item_started in segment:
+                            if not encoding.done():
+                                encoding.cancel()
+                            output = Path(result.output_path)
+                            if output.exists():
+                                output.unlink()
+                            failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
                     if cancelled:
                         break
-                    continue
-                if not interrupted:
-                    try:
-                        session.close()
-                    except Exception as exc:
-                        close_error = exc
-                try:
-                    if close_error:
-                        raise close_error
-                    evidence = verify_feature_18(
-                        session.worker_logs, session.reshade_log_text()
-                    )
-                    assert gpu is not None
-                    for item, result, decoded in segment:
-                        result.report_path = _write_report(
-                            result, options, decoded, gpu, session, evidence
-                        )
-                        successes_by_index[item.index] = result
-                except Exception as exc:
-                    report_path = write_failure_report(
-                        operation="image-batch-verification",
-                        source="; ".join(str(item.path) for item, _result, _decoded in segment),
-                        error=exc,
-                        gpu=gpu,
-                        runtime_bundle=runtime_bundle,
-                        worker_code=session.worker.poll(),
-                        worker_logs=session.worker_logs,
-                        reshade_lines=session.reshade_diagnostics(),
-                    )
-                    failure = f"{exc}\nDiagnostic report: {report_path}"
-                    for item, result, _decoded in segment:
-                        output = Path(result.output_path)
-                        if output.exists():
-                            output.unlink()
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
                 if cancelled:
                     break
-            if cancelled:
-                break
+        finally:
+            decode_executor.shutdown(wait=True, cancel_futures=True)
+            encode_executor.shutdown(wait=True, cancel_futures=True)
     if cancelled:
         completed = set(successes_by_index) | set(failures_by_index)
         for probe in probes:

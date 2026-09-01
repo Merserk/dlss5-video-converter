@@ -8,7 +8,9 @@ from pathlib import Path
 
 from .ffmpeg import ENCODING_QUALITIES
 from .runtime import AUTO_GPU
+from .naming import RENAME_MODES, validate_rename
 from .video import (
+    DLSS_MODEL_PRESETS,
     NR_PRESETS,
     NR_STYLES,
     ConversionOptions,
@@ -39,12 +41,17 @@ class UISettings:
     image_quality: int = 95
     nr_preset: str = "Default"
     automatic_mask: bool = False
+    image_rename_mode: str = "Auto"
+    image_custom_suffix: str = "_DLSS5"
+    video_rename_mode: str = "Auto"
+    video_custom_suffix: str = "_DLSS5"
+    dlss_model_preset: str = "Default"
     gpu: str = AUTO_GPU
     dual_gpu_encode: bool = True
 
     def component_values(
         self,
-    ) -> tuple[str, str, float, float, float, float, float, bool, str, str, str]:
+    ) -> tuple[str, str, float, float, float, float, float, bool, str, str, str, str]:
         return (
             self.nr_preset,
             self.nr_style,
@@ -57,6 +64,7 @@ class UISettings:
             self.codec,
             self.container,
             self.quality,
+            self.dlss_model_preset,
         )
 
 
@@ -74,6 +82,7 @@ def _validate(settings: UISettings) -> UISettings:
             skin_structure_strength=settings.skin_structure_strength,
             automatic_mask=settings.automatic_mask,
             upscaling_factor=settings.upscaling_factor,
+            dlss_model_preset=settings.dlss_model_preset,
         )
     )
     resolve_upscaling_mode(settings.upscaling_factor)
@@ -88,14 +97,16 @@ def _validate(settings: UISettings) -> UISettings:
     for label, (value, choices) in allowed.items():
         if value not in choices:
             raise ValueError(f"Unknown {label}: {value!r}.")
-    if not isinstance(settings.gpu, str) or not settings.gpu.strip():
-        raise ValueError("GPU must be a non-empty selection label.")
-    if not isinstance(settings.dual_gpu_encode, bool):
-        raise ValueError("Dual-GPU encode must be a boolean value.")
     if isinstance(settings.image_quality, bool) or not 1 <= int(settings.image_quality) <= 100:
         raise ValueError("Image quality must be an integer from 1 to 100.")
     if int(settings.image_quality) != settings.image_quality:
         raise ValueError("Image quality must be an integer from 1 to 100.")
+    validate_rename(settings.image_rename_mode, settings.image_custom_suffix)
+    validate_rename(settings.video_rename_mode, settings.video_custom_suffix)
+    if not isinstance(settings.gpu, str) or not settings.gpu.strip():
+        raise ValueError("GPU must be a non-empty selection label.")
+    if not isinstance(settings.dual_gpu_encode, bool):
+        raise ValueError("Dual-GPU encode must be a boolean value.")
     return settings
 
 
@@ -138,6 +149,29 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         parsed = configparser.ConfigParser.BOOLEAN_STATES.get(str(raw_value).casefold())
         return parsed if parsed is not None else default
 
+    image_rename_mode = choice(
+        "image_rename_mode", RENAME_MODES, DEFAULT_SETTINGS.image_rename_mode
+    )
+    image_custom_suffix = section.get(
+        "image_custom_suffix", DEFAULT_SETTINGS.image_custom_suffix
+    )
+    video_rename_mode = choice(
+        "video_rename_mode", RENAME_MODES, DEFAULT_SETTINGS.video_rename_mode
+    )
+    video_custom_suffix = section.get(
+        "video_custom_suffix", DEFAULT_SETTINGS.video_custom_suffix
+    )
+    try:
+        validate_rename(image_rename_mode, image_custom_suffix)
+    except ValueError:
+        image_rename_mode = DEFAULT_SETTINGS.image_rename_mode
+        image_custom_suffix = DEFAULT_SETTINGS.image_custom_suffix
+    try:
+        validate_rename(video_rename_mode, video_custom_suffix)
+    except ValueError:
+        video_rename_mode = DEFAULT_SETTINGS.video_rename_mode
+        video_custom_suffix = DEFAULT_SETTINGS.video_custom_suffix
+
     return UISettings(
         nr_preset=choice("nr_preset", tuple(NR_PRESETS), DEFAULT_SETTINGS.nr_preset),
         nr_style=choice("nr_style", tuple(NR_STYLES), DEFAULT_SETTINGS.nr_style),
@@ -162,6 +196,15 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         image_quality=image_quality(),
         gpu=section.get("gpu", DEFAULT_SETTINGS.gpu) or DEFAULT_SETTINGS.gpu,
         dual_gpu_encode=boolean("dual_gpu_encode", DEFAULT_SETTINGS.dual_gpu_encode),
+        dlss_model_preset=choice(
+            "dlss_model_preset",
+            tuple(DLSS_MODEL_PRESETS),
+            DEFAULT_SETTINGS.dlss_model_preset,
+        ),
+        image_rename_mode=image_rename_mode,
+        image_custom_suffix=image_custom_suffix,
+        video_rename_mode=video_rename_mode,
+        video_custom_suffix=video_custom_suffix,
     )
 
 
@@ -184,6 +227,11 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "quality": settings.quality,
         "image_format": settings.image_format,
         "image_quality": str(settings.image_quality),
+        "image_rename_mode": settings.image_rename_mode,
+        "image_custom_suffix": settings.image_custom_suffix,
+        "video_rename_mode": settings.video_rename_mode,
+        "video_custom_suffix": settings.video_custom_suffix,
+        "dlss_model_preset": settings.dlss_model_preset,
         "gpu": settings.gpu,
         "dual_gpu_encode": str(settings.dual_gpu_encode).lower(),
     }

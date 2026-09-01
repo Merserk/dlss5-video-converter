@@ -10,11 +10,22 @@ from .images import (
     convert_images,
     probe_image,
 )
-from .video import ConversionOptions, ConversionResult, convert_video
+from .video import (
+    ConversionOptions,
+    ConversionResult,
+    VideoBatchResult,
+    VideoConversionFailure,
+    VideoConversionSuccess,
+    convert_video,
+    convert_videos,
+)
 
 __all__ = [
     "ConversionOptions",
     "ConversionResult",
+    "VideoBatchResult",
+    "VideoConversionFailure",
+    "VideoConversionSuccess",
     "ImageBatchResult",
     "ImageConversionOptions",
     "ImageConversionResult",
@@ -22,6 +33,7 @@ __all__ = [
     "convert_image",
     "convert_images",
     "convert_video",
+    "convert_videos",
     "probe_image",
     "probe_video",
 ]
