@@ -15,7 +15,7 @@ import numpy as np
 import pillow_heif
 import rawpy
 import resvg_py
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageCms, ImageOps, TiffImagePlugin
 
 from .runtime import (
     LOGS,
@@ -194,6 +194,15 @@ def probe_image(path: str | os.PathLike[str]) -> tuple[int, int]:
         )
     return width, height
 
+def _json_safe_metadata_value(value: object) -> object:
+    """Convert Pillow metadata values into types supported by json.dumps()."""
+    if isinstance(value, TiffImagePlugin.IFDRational):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metadata_value(item) for item in value]
+    return value
 
 def _srgb_profile_bytes() -> bytes:
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
@@ -332,7 +341,7 @@ def _write_report(
         "gpu": gpu,
         "decoder": decoded.decoder,
         "source_metadata": {
-            key: value
+            key: _json_safe_metadata_value(value)
             for key, value in decoded.metadata.items()
             if key not in {"icc_profile", "exif", "xmp"}
         },
