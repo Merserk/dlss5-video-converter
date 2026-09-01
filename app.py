@@ -19,9 +19,12 @@ from src.images import (
 )
 from src.naming import RENAME_MODES
 from src.runtime import (
+    AUTO_GPU,
     LOGS,
     OUTPUTS,
     cancel_active_job,
+    gpu_choices,
+    set_preferred_gpu,
 )
 from src.prepare import prepare_runtime
 from src.settings import (
@@ -240,11 +243,68 @@ def persist_video_settings(
     return _shared_dlss_values(settings)
 
 
+def _gpu_dropdown_state(selection: str) -> tuple[list[str], str]:
+    """Current GPU choices, falling back to automatic when the saved GPU is gone."""
+    choices = gpu_choices()
+    return choices, selection if selection in choices else AUTO_GPU
+
+
+def build_gpu_control(settings: UISettings):
+    choices, value = _gpu_dropdown_state(settings.gpu)
+    return gr.Dropdown(
+        choices=choices,
+        value=value,
+        label="GPU",
+        info=(
+            "Which detected RTX GPU renders. Auto uses the first one. The render "
+            "fails fast if the native worker cannot bind the selected card."
+        ),
+    )
+
+
+def persist_gpu(gpu: str):
+    """Apply and save the GPU choice, then mirror it onto the other tab."""
+    global _CURRENT_SETTINGS
+    choices, value = _gpu_dropdown_state(gpu)
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+        settings = replace(current, gpu=value)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
+    set_preferred_gpu(value)
+    return gr.update(choices=choices, value=value)
+
+
+def refresh_gpus(gpu: str):
+    """Re-enumerate GPUs so a newly available card can be picked without a restart."""
+    return persist_gpu(gpu)
+
+
+def persist_dual_gpu_encode(enabled: bool) -> bool:
+    global _CURRENT_SETTINGS
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+        settings = replace(current, dual_gpu_encode=bool(enabled))
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
+    return bool(enabled)
+
+
+def _saved_dual_gpu_encode() -> bool:
+    with _CONFIG_LOCK:
+        settings = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+    return settings.dual_gpu_encode
+
+
 def reset_saved_settings() -> tuple:
     global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
         _CURRENT_SETTINGS = DEFAULT_SETTINGS
+    set_preferred_gpu(DEFAULT_SETTINGS.gpu)
+    gpu_choices_list, gpu_value = _gpu_dropdown_state(DEFAULT_SETTINGS.gpu)
     shared = _shared_dlss_values(DEFAULT_SETTINGS)
     message = "All Image and Video settings were reset to defaults."
     return (
@@ -259,6 +319,9 @@ def reset_saved_settings() -> tuple:
         DEFAULT_SETTINGS.quality,
         DEFAULT_SETTINGS.video_rename_mode,
         gr.update(value=DEFAULT_SETTINGS.video_custom_suffix, interactive=False),
+        gr.update(choices=gpu_choices_list, value=gpu_value),
+        gr.update(choices=gpu_choices_list, value=gpu_value),
+        DEFAULT_SETTINGS.dual_gpu_encode,
         message,
         message,
     )
@@ -300,6 +363,7 @@ def _process_video(
         quality=quality,
         preview_seconds=preview_seconds,
         preview_frames=preview_frames,
+        dual_gpu_encode=_saved_dual_gpu_encode(),
     )
 
     def report(value: float, message: str) -> None:
@@ -421,6 +485,7 @@ def render_video_batch(
         quality=quality,
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
+        dual_gpu_encode=_saved_dual_gpu_encode(),
     )
 
     def report(value: float, message: str) -> None:
@@ -686,6 +751,7 @@ def build_app() -> gr.Blocks:
     global _CURRENT_SETTINGS
     settings = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
     _CURRENT_SETTINGS = settings
+    set_preferred_gpu(settings.gpu)
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
 
     with gr.Blocks(title="DLSS 5 Visual Enhancer") as demo:
@@ -759,6 +825,9 @@ def build_app() -> gr.Blocks:
                                 placeholder="_DLSS5",
                                 interactive=settings.image_rename_mode == "Custom",
                             )
+                        with gr.Row():
+                            image_gpu = build_gpu_control(settings)
+                            image_gpu_refresh = gr.Button("Refresh GPUs")
                         gr.Markdown(
                             "Images are processed as 8-bit SDR sRGB. Animated and multipage "
                             "files use their first frame/page."
@@ -856,6 +925,17 @@ def build_app() -> gr.Blocks:
                                 placeholder="_DLSS5",
                                 interactive=settings.video_rename_mode == "Custom",
                             )
+                        with gr.Row():
+                            video_gpu = build_gpu_control(settings)
+                            video_gpu_refresh = gr.Button("Refresh GPUs")
+                        video_dual_gpu = gr.Checkbox(
+                            value=settings.dual_gpu_encode,
+                            label="Use both GPUs (encode on the other GPU)",
+                            info=(
+                                "DLSS renders on the GPU above; NVENC encoding runs on the "
+                                "other detected RTX card. Ignored with a single GPU."
+                            ),
+                        )
                         gr.Checkbox(
                             value=False,
                             interactive=False,
@@ -984,6 +1064,21 @@ def build_app() -> gr.Blocks:
                 queue=False,
             )
 
+        image_gpu.input(persist_gpu, inputs=image_gpu, outputs=video_gpu, queue=False)
+        video_gpu.input(persist_gpu, inputs=video_gpu, outputs=image_gpu, queue=False)
+        image_gpu_refresh.click(
+            refresh_gpus, inputs=image_gpu, outputs=image_gpu, queue=False
+        )
+        video_gpu_refresh.click(
+            refresh_gpus, inputs=video_gpu, outputs=video_gpu, queue=False
+        )
+        video_dual_gpu.input(
+            persist_dual_gpu_encode,
+            inputs=video_dual_gpu,
+            outputs=video_dual_gpu,
+            queue=False,
+        )
+
         image_render.click(
             render_image_batch,
             inputs=image_inputs,
@@ -1032,6 +1127,9 @@ def build_app() -> gr.Blocks:
             video_quality,
             video_rename_mode,
             video_custom_suffix,
+            image_gpu,
+            video_gpu,
+            video_dual_gpu,
             image_status,
             video_status,
         ]

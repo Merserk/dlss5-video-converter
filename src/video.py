@@ -20,6 +20,9 @@ import numpy as np
 from . import ffmpeg
 from .naming import output_filename, require_available_output, validate_rename
 from .runtime import (
+    detect_gpu,
+    list_gpus,
+    validate_gpu_runtime,
     JOBS,
     LOGS,
     OUTPUTS,
@@ -60,7 +63,10 @@ class ConversionOptions:
     rename_mode: str = "Auto"
     custom_suffix: str = "_DLSS5"
     dlss_model_preset: str = "Default"
+    dual_gpu_encode: bool = True
 
+
+MIN_ENCODE_GPU_FREE_MB = 2048
 
 NR_PRESETS = {
     "Default": 0,
@@ -381,11 +387,17 @@ def convert_video(
         job_dir: Path | None = None
         output: Path | None = None
         session: DLSSFrameSession | None = None
-        gpu: dict | None = dict(prepared_runtime.gpu)
+        encoder_failure_logs: list[str] = []
+        # Detect fresh instead of reusing the prepared GPU: the user's GPU
+        # selection can change between renders, and the session later corrects
+        # this to whichever adapter the worker really bound.
+        gpu: dict | None = detect_gpu()
         runtime_bundle: dict | None = prepared_runtime.runtime_bundle
+        validate_gpu_runtime(gpu, runtime_bundle)
         encoder = None
         encoder_setup_thread: threading.Thread | None = None
         producer_thread: threading.Thread | None = None
+        sender_thread: threading.Thread | None = None
         writer_thread: threading.Thread | None = None
         pipeline_stop = threading.Event()
         pipeline_errors: queue.Queue[BaseException] = queue.Queue(maxsize=4)
@@ -450,10 +462,11 @@ def convert_video(
             temp_video = job_dir / "processed-video.mkv"
             native = resolve_native_settings(options)
             if progress:
-                progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
+                progress(0.01, "Starting feature 18 (the native worker picks the adapter)")
 
             encoder_setup: list[tuple] = []
             encoding_stage_started = time.perf_counter()
+            encode_gpu: dict | None = None
 
             def prepare_encoder() -> None:
                 encoder_started = time.perf_counter()
@@ -467,6 +480,7 @@ def convert_video(
                             output_width,
                             output_height,
                             float(metadata["fps"]),
+                            encode_gpu=encode_gpu,
                         )
                     )
                 except BaseException as exc:
@@ -476,10 +490,14 @@ def convert_video(
                         time.perf_counter() - encoder_started
                     )
 
-            encoder_setup_thread = threading.Thread(
-                target=prepare_encoder, name="dlss5-encoder-setup", daemon=True
-            )
-            encoder_setup_thread.start()
+            # With two cards the encoder must wait for the worker handshake to
+            # learn the render adapter, so NVENC can run on the other card.
+            defer_encoder = options.dual_gpu_encode and len(list_gpus()) > 1
+            if not defer_encoder:
+                encoder_setup_thread = threading.Thread(
+                    target=prepare_encoder, name="dlss5-encoder-setup", daemon=True
+                )
+                encoder_setup_thread.start()
             session_started = time.perf_counter()
             session = DLSSFrameSession(
                 input_width=input_width,
@@ -496,7 +514,39 @@ def convert_video(
                 controller=controller,
             )
             timings["native_setup_seconds"] = time.perf_counter() - session_started
-            encoder_setup_thread.join()
+            if defer_encoder:
+                bound = str(gpu.get("bound_adapter") or gpu["name"]).casefold()
+                encode_gpu = next(
+                    (
+                        entry
+                        for entry in list_gpus()
+                        if entry["name"].casefold() != bound
+                    ),
+                    None,
+                )
+                if encode_gpu is not None and (
+                    int(encode_gpu.get("memory_free_mb", 0)) < MIN_ENCODE_GPU_FREE_MB
+                ):
+                    # An NVENC session that cannot allocate dies mid-encode and
+                    # takes the whole render with it; stay on the render GPU.
+                    if progress:
+                        progress(
+                            0.02,
+                            f"Dual GPU skipped: {encode_gpu['name']} has only "
+                            f"{encode_gpu.get('memory_free_mb', 0)} MB VRAM free "
+                            f"(needs {MIN_ENCODE_GPU_FREE_MB} MB); encoding on "
+                            f"{gpu['display_name']}",
+                        )
+                    encode_gpu = None
+                elif encode_gpu is not None and progress:
+                    progress(
+                        0.02,
+                        f"Dual GPU: rendering on {gpu['display_name']}, "
+                        f"encoding on {encode_gpu['name']}",
+                    )
+                prepare_encoder()
+            else:
+                encoder_setup_thread.join()
             encoder_setup_thread = None
             timings["setup_seconds"] = max(
                 timings["native_setup_seconds"],
@@ -527,6 +577,7 @@ def convert_video(
                 selected_encoder,
                 encoding_quality,
             ) = encoder_setup[0]
+            encoder_failure_logs = encoder_logs
             assert encoder.stdin is not None
 
             prepared_bytes = render_width * render_height * 8
@@ -601,6 +652,32 @@ def convert_video(
                     raw_stream.height = output_height
                     raw_stream.pix_fmt = "rgba"
                     raw_stream.time_base = metadata["time_base"]
+                    # Keep the source's fine time base in the encoder context
+                    # too. The default (1/rate) quantizes VFR timestamps to
+                    # frame-number ticks, and two close frames then collide
+                    # into one tick, which the NUT muxer rejects as
+                    # non-monotonic dts.
+                    raw_stream.codec_context.time_base = metadata["time_base"]
+                    last_mux_pts: int | None = None
+
+                    def mux_packet(packet) -> None:
+                        """Surface encoder death instead of a bare mux EINVAL."""
+                        try:
+                            nut.mux(packet)
+                        except Exception as mux_exc:
+                            encoder_code = encoder.poll()
+                            if encoder_code is None:
+                                raise
+                            raise RuntimeError(
+                                f"The video encoder ({selected_encoder}) exited "
+                                f"with code {encoder_code} during frame "
+                                f"{written + 1}/{frame_count}:\n"
+                                + (
+                                    "\n".join(encoder_logs[-40:])
+                                    or "It produced no output."
+                                )
+                            ) from mux_exc
+
                     while not pipeline_stop.is_set():
                         if controller.cancel.is_set():
                             raise Cancelled("Render stopped by user.")
@@ -614,12 +691,18 @@ def convert_video(
                         output_frame = av.VideoFrame.from_ndarray(processed, format="rgba")
                         output_frame.pts = output_pts
                         output_frame.time_base = metadata["time_base"]
+                        if last_mux_pts is not None and output_frame.pts <= last_mux_pts:
+                            output_frame.pts = last_mux_pts + 1
+                            writer_stats["pts_collisions"] = (
+                                int(writer_stats.get("pts_collisions", 0)) + 1
+                            )
+                        last_mux_pts = output_frame.pts
                         for packet in raw_stream.encode(output_frame):
-                            nut.mux(packet)
+                            mux_packet(packet)
                         written += 1
                     if not pipeline_stop.is_set():
                         for packet in raw_stream.encode():
-                            nut.mux(packet)
+                            mux_packet(packet)
                         nut.close()
                         nut = None
                     writer_stats["written_frames"] = written
@@ -631,13 +714,48 @@ def convert_video(
                             nut.close()
                     writer_stats["seconds"] = time.perf_counter() - writer_started
 
+            sent_frames: queue.Queue[object] = queue.Queue(maxsize=2)
+
+            def send_frames() -> None:
+                # A dedicated sender lets the main thread keep draining the
+                # worker's stdout; sending and receiving from one thread would
+                # deadlock on full pipes once a frame is in flight.
+                try:
+                    while not pipeline_stop.is_set():
+                        if controller.cancel.is_set():
+                            raise Cancelled("Render stopped by user.")
+                        try:
+                            item = prepared_frames.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if item is stop_marker:
+                            put_pipeline(sent_frames, stop_marker)
+                            return
+                        index, rgba, guide, pts = item
+                        session.send_frame(
+                            index=index,
+                            rgba=rgba,
+                            motion=guide.motion,
+                            reset=guide.reset,
+                            pts=pts,
+                        )
+                        if not put_pipeline(sent_frames, (index, guide.reset)):
+                            return
+                except BaseException as exc:
+                    record_pipeline_error(exc)
+                    put_pipeline(sent_frames, stop_marker)
+
             producer_thread = threading.Thread(
                 target=produce_frames, name="dlss5-video-producer", daemon=True
+            )
+            sender_thread = threading.Thread(
+                target=send_frames, name="dlss5-worker-sender", daemon=True
             )
             writer_thread = threading.Thread(
                 target=write_frames, name="dlss5-video-writer", daemon=True
             )
             producer_thread.start()
+            sender_thread.start()
             writer_thread.start()
             delivered = 0
             scene_resets = 0
@@ -650,21 +768,15 @@ def convert_video(
                 if not pipeline_errors.empty():
                     raise pipeline_errors.get_nowait()
                 try:
-                    item = prepared_frames.get(timeout=0.1)
+                    item = sent_frames.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 if item is stop_marker:
                     break
-                index, rgba, guide, pts = item
-                scene_resets += int(guide.reset and index != 0)
+                index, was_reset = item
+                scene_resets += int(was_reset and index != 0)
                 dlss_started = time.perf_counter()
-                processed, out_pts = session.process(
-                    index=index,
-                    rgba=rgba,
-                    motion=guide.motion,
-                    reset=guide.reset,
-                    pts=pts,
-                )
+                processed, out_pts = session.receive_frame(index)
                 dlss_seconds += time.perf_counter() - dlss_started
                 if is_preview:
                     if preview_pts_origin is None:
@@ -694,6 +806,8 @@ def convert_video(
                 raise Cancelled("Render stopped by user.")
             producer_thread.join()
             producer_thread = None
+            sender_thread.join()
+            sender_thread = None
             writer_thread.join()
             writer_thread = None
             if not pipeline_errors.empty():
@@ -800,6 +914,7 @@ def convert_video(
                 "nr_native_fallback": nr_native_fallback,
                 "ngx_setup_result": f"0x{setup_result:08X}",
                 "scene_resets": scene_resets,
+                "pts_collisions_adjusted": int(writer_stats.get("pts_collisions", 0)),
                 "pipeline": "renodx-dlssnr-feature18",
                 "feature_id": 18,
                 "feature_18_confirmed": True,
@@ -860,7 +975,12 @@ def convert_video(
                 if target is not None:
                     with suppress(queue.Full):
                         target.put_nowait(stop_marker)
-            for thread in (encoder_setup_thread, producer_thread, writer_thread):
+            for thread in (
+                encoder_setup_thread,
+                producer_thread,
+                sender_thread,
+                writer_thread,
+            ):
                 if thread is not None:
                     thread.join(timeout=2)
             if session is not None and not session.closed:
@@ -887,6 +1007,7 @@ def convert_video(
                 worker_code=worker_code,
                 worker_logs=worker_logs,
                 reshade_lines=reshade_lines,
+                encoder_logs=list(encoder_failure_logs),
             )
             raise RuntimeError(f"{exc}\nDiagnostic report: {report_path}") from exc
         finally:

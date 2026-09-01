@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ffmpeg import ENCODING_QUALITIES
+from .runtime import AUTO_GPU
 from .naming import RENAME_MODES, validate_rename
 from .video import (
     DLSS_MODEL_PRESETS,
@@ -45,6 +46,8 @@ class UISettings:
     video_rename_mode: str = "Auto"
     video_custom_suffix: str = "_DLSS5"
     dlss_model_preset: str = "Default"
+    gpu: str = AUTO_GPU
+    dual_gpu_encode: bool = True
 
     def component_values(
         self,
@@ -100,6 +103,10 @@ def _validate(settings: UISettings) -> UISettings:
         raise ValueError("Image quality must be an integer from 1 to 100.")
     validate_rename(settings.image_rename_mode, settings.image_custom_suffix)
     validate_rename(settings.video_rename_mode, settings.video_custom_suffix)
+    if not isinstance(settings.gpu, str) or not settings.gpu.strip():
+        raise ValueError("GPU must be a non-empty selection label.")
+    if not isinstance(settings.dual_gpu_encode, bool):
+        raise ValueError("Dual-GPU encode must be a boolean value.")
     return settings
 
 
@@ -187,6 +194,8 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
         ),
         image_quality=image_quality(),
+        gpu=section.get("gpu", DEFAULT_SETTINGS.gpu) or DEFAULT_SETTINGS.gpu,
+        dual_gpu_encode=boolean("dual_gpu_encode", DEFAULT_SETTINGS.dual_gpu_encode),
         dlss_model_preset=choice(
             "dlss_model_preset",
             tuple(DLSS_MODEL_PRESETS),
@@ -223,6 +232,8 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "video_rename_mode": settings.video_rename_mode,
         "video_custom_suffix": settings.video_custom_suffix,
         "dlss_model_preset": settings.dlss_model_preset,
+        "gpu": settings.gpu,
+        "dual_gpu_encode": str(settings.dual_gpu_encode).lower(),
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")

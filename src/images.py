@@ -627,7 +627,7 @@ def convert_images(
             )
             raise RuntimeError(f"{exc}\nDiagnostic report: {report_path}") from exc
         if progress:
-            progress(0.0, f"Starting feature 18 on {gpu['display_name']}")
+            progress(0.0, "Starting feature 18 (the native worker picks the adapter)")
         total = len(probes)
         factor, mode = resolve_upscaling_mode(neural.upscaling_factor)
         native_settings = resolve_native_settings(neural)
