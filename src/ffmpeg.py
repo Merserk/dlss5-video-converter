@@ -298,6 +298,9 @@ def start_encoder(
 
 
 def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> None:
+    temp_probe = probe_video(temp_video)
+    duration = temp_probe.get("duration", 0.0)
+    input_args = ["-t", str(duration)] if duration > 0 else []
     if container == "MKV":
         maps = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?"]
         streams = ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
@@ -321,6 +324,7 @@ def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> N
         "-y",
         "-i",
         str(temp_video),
+        *input_args,
         "-i",
         str(source),
         *maps,
@@ -329,7 +333,6 @@ def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> N
         "-map_chapters",
         "1",
         *streams,
-        "-shortest",
         str(output),
     ]
     result = subprocess.run(
