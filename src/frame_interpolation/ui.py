@@ -143,12 +143,15 @@ class FrameInterpolationTab:
 
 
 def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab:
+    # The uploader lives in its own full-width row, above the input/output columns,
+    # so both preview panes are the first element in their column and line up
+    # vertically regardless of how many files are queued in the uploader.
+    sources = gr.File(
+        label="Input video(s)", file_count="multiple", file_types=["video"],
+        type="filepath", allow_reordering=True, elem_id="frame-interpolation-upload-list",
+    )
     with gr.Row():
         with gr.Column(scale=3):
-            sources = gr.File(
-                label="Input video(s)", file_count="multiple", file_types=["video"],
-                type="filepath", allow_reordering=True, elem_id="frame-interpolation-upload-list",
-            )
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
             with gr.Accordion("DLSS Frame Generation Settings", open=True):
                 with gr.Row():
