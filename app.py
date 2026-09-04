@@ -19,6 +19,7 @@ except Exception:
 
 import gradio as gr
 
+from src.compare.ui import bind_comparison_events, build_compare_tab
 from src.core.paths import LOGS, OUTPUTS
 from src.core.runtime import prepare_runtime
 from src.core.terminal import init_console
@@ -117,17 +118,22 @@ def build_app() -> gr.Blocks:
             "[GitHub](https://github.com/Merserk/dlss5-visual-enhancer)",
             elem_id="app-title",
         )
-        with gr.Tabs(selected="image"):
+        with gr.Tabs(selected="image") as tabs:
             with gr.Tab("Image", id="image"):
                 image_tab = build_image_tab(settings)
             with gr.Tab("Video", id="video"):
                 video_tab = build_video_tab(settings)
             with gr.Tab("Frame Interpolation", id="frame-interpolation"):
                 frame_tab = build_frame_interpolation_tab(settings)
+            with gr.Tab("Comparison", id="compare"):
+                compare_tab = build_compare_tab()
             with gr.Tab("Settings", id="settings"):
                 settings_tab = build_settings_tab(settings, ai_gpu_choices, video_gpu_choices)
 
         bind_settings_events(settings_tab, image_tab, video_tab, frame_tab)
+        # Video and Frame Interpolation aren't wired into Comparison yet (they need a synced
+        # player, not the image before/after slider) — that's a later phase.
+        bind_comparison_events(compare_tab, tabs, image_tab=image_tab)
     return demo
 
 

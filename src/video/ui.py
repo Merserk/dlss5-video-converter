@@ -277,12 +277,15 @@ class VideoTab:
 
 
 def build_video_tab(settings: UISettings) -> VideoTab:
+    # The uploader lives in its own full-width row, above the input/output columns,
+    # so both preview panes are the first element in their column and line up
+    # vertically regardless of how many files are queued in the uploader.
+    sources = gr.File(
+        label="Input video(s)", file_count="multiple", file_types=["video"],
+        type="filepath", allow_reordering=True, elem_id="video-upload-list",
+    )
     with gr.Row():
         with gr.Column(scale=3):
-            sources = gr.File(
-                label="Input video(s)", file_count="multiple", file_types=["video"],
-                type="filepath", allow_reordering=True, elem_id="video-upload-list",
-            )
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)

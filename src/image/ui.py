@@ -12,6 +12,7 @@ from ..core.naming import RENAME_MODES
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
 from ..settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
 from ..settings.storage import processing_gpu_settings
+from ..compare.models import ComparisonItem
 from .decoder import decode_image
 from .encoder import take_image_preview
 from .batch import convert_images
@@ -145,9 +146,12 @@ def render_image_batch(
         result = convert_images(input_paths, options, progress=report)
     except Exception as exc:
         traceback.print_exc()
-        return [], [], None, [], f"Failed: {exc}"
+        return [], [], None, [], f"Failed: {exc}", []
 
     gallery = []
+    comparison_items = [
+        ComparisonItem(f"Input: {Path(path).name}", path) for path in input_paths
+    ]
     for item in result.successes:
         preview = take_image_preview(item.output_path)
         if preview is None:
@@ -156,6 +160,8 @@ def render_image_batch(
                 preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
                 preview = preview.copy()
         gallery.append((preview, Path(item.output_path).name))
+        # Full-resolution output path, not the thumbnail above — comparisons need the real file.
+        comparison_items.append(ComparisonItem(f"Output: {Path(item.output_path).name}", item.output_path))
     files = [item.output_path for item in result.successes]
     rows = [
         [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
@@ -171,7 +177,7 @@ def render_image_batch(
     )
     if result.failures:
         status += f"\nFirst error: {result.failures[0].error}"
-    return gallery, files, result.zip_path, rows, status
+    return gallery, files, result.zip_path, rows, status, comparison_items
 
 @dataclass(slots=True)
 class ImageTab:
@@ -187,6 +193,8 @@ class ImageTab:
     stop: object
     reset: object
     output_gallery: object
+    send_to_compare: object
+    comparison_items: object
     output_files: object
     zip_download: object
     status: object
@@ -203,12 +211,15 @@ class ImageTab:
 
 def build_image_tab(settings: UISettings) -> ImageTab:
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
+    # The uploader lives in its own full-width row, above the input/output columns,
+    # so both preview panes are the first element in their column and line up
+    # vertically regardless of how many files are queued in the uploader.
+    sources = gr.File(
+        label="Input image(s)", file_count="multiple", file_types=upload_types,
+        type="filepath", allow_reordering=True, elem_id="image-upload-list",
+    )
     with gr.Row():
         with gr.Column(scale=3):
-            sources = gr.File(
-                label="Input image(s)", file_count="multiple", file_types=upload_types,
-                type="filepath", allow_reordering=True, elem_id="image-upload-list",
-            )
             input_gallery = gr.Gallery(
                 label="Input preview", columns=3, height=520, object_fit="contain",
                 interactive=False, buttons=["fullscreen"], elem_id="image-input-preview",
@@ -245,6 +256,10 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 interactive=False, buttons=["download", "download_all", "fullscreen"],
                 elem_id="image-output-preview",
             )
+            # Holds the real (non-thumbnail) input/output paths from the last render,
+            # so "Send to Comparison" always hands off full-resolution files.
+            comparison_items = gr.State([])
+            send_to_compare = gr.Button("Send to Comparison")
             output_files = gr.File(
                 label="Rendered image files", file_count="multiple", interactive=False,
                 elem_id="image-output-list",
@@ -258,7 +273,8 @@ def build_image_tab(settings: UISettings) -> ImageTab:
             )
     tab = ImageTab(
         sources, input_gallery, neural, model_preset, output_format, quality, rename_mode,
-        custom_suffix, render, stop, reset, output_gallery, output_files, zip_download, status, results
+        custom_suffix, render, stop, reset, output_gallery, send_to_compare, comparison_items,
+        output_files, zip_download, status, results
     )
     bind_image_events(tab)
     return tab
@@ -274,7 +290,10 @@ def bind_image_events(tab: ImageTab) -> None:
     )
     tab.render.click(
         render_image_batch, inputs=tab.render_inputs,
-        outputs=[tab.output_gallery, tab.output_files, tab.zip_download, tab.results, tab.status],
+        outputs=[
+            tab.output_gallery, tab.output_files, tab.zip_download, tab.results, tab.status,
+            tab.comparison_items,
+        ],
         concurrency_limit=1, show_progress="full", show_progress_on=tab.output_gallery,
     )
     tab.stop.click(cancel_active_job, outputs=tab.status, queue=False)
